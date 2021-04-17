@@ -130,6 +130,151 @@ class DBox(object):
         output.clamp_(max=1, min=0)
         return output
 
+def decode(loc, dbox_list):
+    '''
+    loc  = [‡™cx,‡™cy,‡™width,‡™height]
+    DBox = [cx_d,cy_d,w_d,h_d]
+
+    calc bounding box from offset information.
+    cx = cx_d + 0.1*‡™cx * w_d
+    cy = cy_d + 0.1*‡™cy * h_d
+    w  = w_d * exp(0.2*‡™w)
+    h  = h_d * exp(0.2*‡™h)
+    '''
+
+    boxes = torch.cat((
+        dbox_list[:,2] + loc[:, :2] * 0.1 * dbox_list[:, 2:],   # [cx, cy]
+        dbox_list[:,2:] * torch.exp(loc[:, 2:] * 0.2)), dim=1)  # [w, h]
+
+    # [cx, cy, width, height] -> [xmin, ymin, xmax, ymax]
+    boxes[:, :2] -= boxes[:, 2:] / 2    # [cx - width/2, cy - height/2] = [xmin, ymin]
+    boxes[:, 2:] += boxes[:, :2]        # [xmin + width, xmax + height] = [xmax, ymax]
+
+    return boxes
+
+def nm_suppression(boxes, scores, overlap=0.45, top_k=200):
+
+    '''
+    boxes  : [Counts of BBox.(confidence > 0.01), 4]
+        BBox information.
+    scores : [Counts of BBox.(confidence > 0.01)]
+        Confidence information
+
+    returns: keep:list, count : int
+    '''
+
+    count = 0
+    keep = scores.new(scores.size(0)).zero_().long()
+
+    x1 = boxes[:, 0] # xmin
+    y1 = boxes[:, 1] # ymin
+    x2 = boxes[:, 2] # xmax
+    y2 = boxes[:, 3] # ymax
+    area = torch.mul(x2-x1, y2-y1)
+
+    tmp_x1 = boxes.new()
+    tmp_y1 = boxes.new()
+    tmp_x2 = boxes.new()
+    tmp_y2 = boxes.new()
+    tmp_w  = boxes.new()
+    tmp_h  = boxes.new()
+
+    # sort
+    v, idx = scores.sort()
+
+    # get top 200 indexs
+    idx = idx[-top_k:]
+
+    while idx.numel() > 0:
+        # get top score's index
+        i = idx[-1]
+
+        #===== update outputs =====
+        keep[count] = i
+        count += 1
+        #==========================
+
+        if idx.size(0) == 1:
+            break
+
+        # update idx's list size
+        idx = idx[:-1]
+        torch.index_select(x1, dim=0, idx, out=tmp_x1)
+        torch.index_select(y1, dim=0, idx, out=tmp_y1)
+        torch.index_select(x2, dim=0, idx, out=tmp_x2)
+        torch.index_select(y2, dim=0, idx, out=tmp_y2)
+
+        # limits values
+        tmp_x1 = torch.clamp(tmp_x1, min=x1[i])
+        tmp_y1 = torch.clamp(tmp_y1, min=y1[i])
+        tmp_x2 = torch.clamp(tmp_x2, max=x2[i])
+        tmp_y2 = torch.clamp(tmp_y2, max=y2[i])
+
+        tmp_w.resize_as_(tmp_x2)
+        tmp_h.resize_as_(tmp_y2)
+
+        tmp_w = tmp_x2 - tmp_x1
+        tmp_h = tmp_y2 - tmp_y1
+
+        tmp_w = torch.clamp(tmp_w, min=0.0)
+        tmp_h = torch.clamp(tmp_h, min=0.0)
+
+        inter = tmp_w * tmp_h
+
+        rem_areas = torch.index_select(area, 0, idx)
+        union     = (rem_areas - inter) + area[i]
+        IoU = inter / union
+
+        idx = idx[IoU.le(overlap)]
+    return keep, count
+
+class Detect(Function):
+    def __init__(self, conf_thresh=0.01, top_k=200, nms_thresh=0.45):
+        self.softmax = nn.Softmax(dim=-1)
+        self.conf_thresh = conf_thresh
+        self.top_k = top_k
+        self.nms_thresh = nms_thresh
+
+    def forward(self, loc_data, conf_data, dbox_list):
+
+        '''
+        loc_data  = [batch_num, 8732, 4]
+            location information
+        conf_data = [batch_num, 8732, num_classes]
+            confidence information
+        dbox_list = [8732, 4]
+            DBox information
+        '''
+        num_batch   = loc_data.size(0)
+        num_dbox    = loc_data.size(1)
+        num_classes = conf_data.size(2)
+
+        conf_data = self.softmax(conf_data)
+
+        # create output template
+        output = torch.zeros(num_batch, num_classes, self.top_k, 5)
+
+        # [batch_num, 8732, num_classes]  ->  [batch_num, num_classes, 8732]
+        conf_preds = conf_data.transpose(2, 1)
+
+        for i in range(num_batch):
+            decoded_boxes = decode(loc_data[i], dbox_list)
+            conf_scores = conf_preds[i].clone()
+            for cl in range(1, num_classes):
+                c_mask = conf_scores[cl].gt(self.conf_thresh)
+                scores = conf_scores[cl][c_mask]
+
+                if scores.nelement()==0:
+                    continue
+                l_mask = c_mask.unsqueeze(1).expand_as(decoded_boxes)
+                boxes = decoded_boxes[l_mask].view(-1, 4)
+
+                ids, count = nm_suppression(boxes, scores, self.nms_thresh, self.top_k)
+
+                output[i, cl, :count] = torch.cat((scores[ids[:count]].unsqueeze(1), boxes[ids[:count]]), 1)
+        return output
+
+
 class SSD(nn.Module):
     def __init__(self, phase, ssd_cfg):
         super(SSD, self).__init__()
@@ -144,6 +289,51 @@ class SSD(nn.Module):
 
         if phase == 'inference':
             self.detect = Detect()
+
+    def forward(self, x):
+        sources = list()
+        loc     = list()
+        conf    = list()
+
+        for k in range(23):
+            x = self.vgg[k](x)
+
+        source1 = self.L2Norm(x)
+        sources.append(source1)
+
+        for k in range(23, len(self.vgg)):
+            x = self.vgg[k](x)
+
+        sources.append(x)
+
+        for k, v in enumerate(self.extras):
+            x = F.relu(v(x), inplace=True)
+            if k % 2 == 1:
+                sources.append(x)
+
+        for (x, 1, c) in zip(sources, self.loc, self.conf):
+            loc.append(l(x).permute(0, 2, 3, 1).contiguous())
+            conf.append(c(x).permute(0, 2, 3, 1).contiguous())
+
+        # loc size  -> torch.Size([batch_num, 34928])
+        loc  = torch.cat([o.view(o.size(0), -1) for o in loc],1)
+        # conf size -> torch.Size([batch_num, 183372])
+        conf = torch.cat([o.view(o.size(0), -1) for o in conf],1)
+
+        # loc size  -> torch.Size([batch_num, 8732, 4])
+        loc  = loc.view(loc.size(0), -1, 4)
+        # conf size -> torch.Size([batch_num, 8732, 21])
+        conf = conf.view(conf.size(0), -1, self.num_classes)
+
+        # create output:tupple
+        output = (loc, conf, self.dbox_list)
+
+        if self.phase == 'inference':
+            # torch.Size([batch_num, 21, 200 5])
+            return self.detect(output[0], output[1], output[2])
+        else:
+            # tupple (loc, conf, dbox_list)
+            return output
 
 if __name__ == '__main__':
     vgg_test = make_vgg()
