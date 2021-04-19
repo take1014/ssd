@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.init as init
 import torch.nn.functional as F
 from torch.autograd import Function
+from utils import match
 import torch.utils.data as data
 import torch
 
@@ -132,14 +133,14 @@ class DBox(object):
 
 def decode(loc, dbox_list):
     '''
-    loc  = [‡™cx,‡™cy,‡™width,‡™height]
-    DBox = [cx_d,cy_d,w_d,h_d]
+    loc  = [d_cx,d_cy,d_width,d_height]
+    DBox = [cx_dbox, cy_dbox, w_dbox, h_dbox]
 
     calc bounding box from offset information.
-    cx = cx_d + 0.1*‡™cx * w_d
-    cy = cy_d + 0.1*‡™cy * h_d
-    w  = w_d * exp(0.2*‡™w)
-    h  = h_d * exp(0.2*‡™h)
+    cx = cx_dbox + 0.1*d_cx * w_dbox
+    cy = cy_dbox + 0.1*d_cy * h_dbox
+    w  = w_dbox * exp(0.2*d_w)
+    h  = h_dbox * exp(0.2*d_h)
     '''
 
     boxes = torch.cat((
@@ -152,6 +153,7 @@ def decode(loc, dbox_list):
 
     return boxes
 
+# Non-Maximum Suppression
 def nm_suppression(boxes, scores, overlap=0.45, top_k=200):
 
     '''
@@ -170,6 +172,8 @@ def nm_suppression(boxes, scores, overlap=0.45, top_k=200):
     y1 = boxes[:, 1] # ymin
     x2 = boxes[:, 2] # xmax
     y2 = boxes[:, 3] # ymax
+
+    # calc bounding box area
     area = torch.mul(x2-x1, y2-y1)
 
     tmp_x1 = boxes.new()
@@ -199,10 +203,10 @@ def nm_suppression(boxes, scores, overlap=0.45, top_k=200):
 
         # update idx's list size
         idx = idx[:-1]
-        torch.index_select(x1, dim=0, idx, out=tmp_x1)
-        torch.index_select(y1, dim=0, idx, out=tmp_y1)
-        torch.index_select(x2, dim=0, idx, out=tmp_x2)
-        torch.index_select(y2, dim=0, idx, out=tmp_y2)
+        torch.index_select(x1, 0, idx, out=tmp_x1)
+        torch.index_select(y1, 0, idx, out=tmp_y1)
+        torch.index_select(x2, 0, idx, out=tmp_x2)
+        torch.index_select(y2, 0, idx, out=tmp_y2)
 
         # limits values
         tmp_x1 = torch.clamp(tmp_x1, min=x1[i])
@@ -258,22 +262,139 @@ class Detect(Function):
         conf_preds = conf_data.transpose(2, 1)
 
         for i in range(num_batch):
+            # calc bounding box's [xmin, ymin, xmax, ymax]
             decoded_boxes = decode(loc_data[i], dbox_list)
             conf_scores = conf_preds[i].clone()
             for cl in range(1, num_classes):
+                # create conf mask.  conf > conf_thresh
                 c_mask = conf_scores[cl].gt(self.conf_thresh)
                 scores = conf_scores[cl][c_mask]
 
                 if scores.nelement()==0:
                     continue
+
+                # l_mask:torch.Size([8732, 4])
                 l_mask = c_mask.unsqueeze(1).expand_as(decoded_boxes)
+                # torch.Size([Bounding box's count, 4])
                 boxes = decoded_boxes[l_mask].view(-1, 4)
 
                 ids, count = nm_suppression(boxes, scores, self.nms_thresh, self.top_k)
 
+                # update output
                 output[i, cl, :count] = torch.cat((scores[ids[:count]].unsqueeze(1), boxes[ids[:count]]), 1)
+
         return output
 
+class MultiBoxLoss(nn.Module):
+    def __init__(self, jaccard_thresh=0.5, neg_pos=3, device='cpu'):
+        super(MultiBoxLoss, self).__init__()
+        self.jaccard_thresh = jaccard_thresh
+        self.negpos_ratio   = neg_pos
+        self.device         = device
+
+    def forward(self, predictions, targets):
+        """
+        MultiBoxLoss
+        Inputs
+        ----------
+        predictions:tupple
+            (loc=torch.Size([num_batch, 8732, 4]), conf=torch.Size([num_batch, 8732, 21]), dbox_list=torch.Size [8732,4])
+
+        targets : [num_batch, num_objs, 5]
+
+        Outputs
+        -------
+        loss_l : loc  loss
+        loss_c : conf loss
+        """
+        # loc_data  = torch.Size([num_batch, 8732, 4])
+        # conf_data = torch.Size([num_batch, 8732, 21])
+        # dbox_list = torch.Size [8732,4])
+        loc_data, conf_data, dbox_list = predictions
+        num_batch   = conf_data.size(0) # num_batch
+        num_dbox    = conf_data.size(1) # 8732
+        num_classes = conf_data.size(2) # 21
+
+        conf_t_label = torch.LongTensor(num_batch, num_dbox).to(self.device)
+        loc_t        = torch.Tensor(num_batch, num_dbox, 4).to(self.device)
+
+        # Create true values. values: loc_t and conf_t_label
+        for idx in range(num_batch):
+            # targets : [num_batch, num_objs, 5(cx,cy,w,h,label)]
+            # Get annotation BBox's(cx, cy, w, h) in now batch
+            # truths = [[cx1,cy1, w1, h1], [cx2,cy2,w2,h2], ..., [cx8732, cy8732, w8732, h8732]]
+            truths = targets[idx][:, :-1].to(self.device)   # BBox
+            # labels = [label1, label2, ... , label8732]
+            labels = targets[idx][:, -1].to(self.device)
+            # dbox = [8732, 4(cx, cy, w, h)]
+            dbox = dbox_list.to(self.device)
+
+            # Match each prior box with the ground truth box of the highest jaccard
+            # overlap, encode the bounding boxes, then return the matched indices
+            # corresponding to both confidence and location preds.
+            variance = [0.1, 0.2]
+            match(self.jaccard_thresh, truths, dbox, variance, labels, loc_t, conf_t_label, idx)
+
+        #===== Calc 'loc loss' just for Positive Box =====
+        # pos_mask: torch.Size([num_batch, 8732])
+        pos_mask = conf_t_label > 0
+        # torch.Size([num_bath, 8732]) -> torch.Size([num_batch, 8732, 4])
+        # pos_mask.dim() == 3
+        pos_idx = pos_mask.unsqueeze(pos_mask.dim()).expand_as(loc_data)
+        loc_p = loc_data[pos_idx].view(-1, 4)   # pred
+        loc_t = loc_t[pos_idx].view(-1, 4)      # true
+        # Calc loc loss
+        loss_l = F.smooth_l1_loss(loc_p, loc_t, reduction='sum')
+        #==========================================
+
+        # conf_data = torch.Size([num_batch, 8732, 21])
+        # batch_conf = torch.Size([num_batch*8732, 21])
+        batch_conf = conf_data.view(-1, num_classes)
+        # Calc cross_entropy. conf_t_label.view(-1) = torch.Size([num_batch*8732])
+        loss_c = F.cross_entropy(batch_conf, conf_t_label.view(-1), reduction='none')
+
+        # Calc Positive Box's loss.
+        # Positive Box's confidence loss is zero
+        # loss_c: torch.Size([num_batch, 8732])
+        loss_c = loss_c.view(num_batch, -1)
+        loss_c[pos_mask] = 0
+
+        # Hard Negative Mining
+        # _: sorted Tensor, loss_idx: indices
+        _, loss_idx = loss_c.sort(dim=1, descending=True)
+        # _: sorted Tensor, idx_rank: indices(sorted)
+        _, idx_rank = loss_idx.sort(dim=1)
+
+        # pos_mask: torch.Size([num_batch, 8732])
+        # num_pos: torch.Size([num_batch, 1])
+        num_pos = pos_mask.long().sum(dim=1, keepdim=True)
+        # num_neg: torch.Size([num_batch, 1])
+        num_neg = torch.clamp(num_pos*self.negpos_ratio, max=num_dbox)
+        neg_mask = idx_rank < (num_neg).expand_as(idx_rank)
+
+        # pos_idx_mask : torch.Size([num_batch, 8732, 21])
+        pos_idx_mask = pos_mask.unsqueeze(2).expand_as(conf_data)
+        # neg_idx_mask : torch.Size([num_batch, 8732, 21])
+        neg_idx_mask = neg_mask.unsqueeze(2).expand_as(conf_data)
+
+        # Get positive and negative conf data and create conf_hnm.
+        # conf_p_hnm: torch.Size([num_pos+neg_pos, 21])
+        # gt(0): greater than 0
+        conf_p_hnm = conf_data[(pos_idx_mask+neg_idx_mask).gt(0)].view(-1, num_classes)
+        # conf_t_label_hnm: torch.Size([pos+neg])
+        # gt(0): greater than 0
+        conf_t_label_hnm = conf_t_label[(pos_mask+neg_mask).gt(0)]
+
+        loss_c = F.cross_entropy(conf_p_hnm, conf_t_label_hnm, reduction='sum')
+
+        # Summary of positive box
+        N = num_pos.sum()
+
+        # Calc average
+        loss_l /= N
+        loss_c /= N
+
+        return loss_l, loss_c
 
 class SSD(nn.Module):
     def __init__(self, phase, ssd_cfg):
@@ -311,7 +432,7 @@ class SSD(nn.Module):
             if k % 2 == 1:
                 sources.append(x)
 
-        for (x, 1, c) in zip(sources, self.loc, self.conf):
+        for (x, l, c) in zip(sources, self.loc, self.conf):
             loc.append(l(x).permute(0, 2, 3, 1).contiguous())
             conf.append(c(x).permute(0, 2, 3, 1).contiguous())
 
@@ -329,7 +450,7 @@ class SSD(nn.Module):
         output = (loc, conf, self.dbox_list)
 
         if self.phase == 'inference':
-            # torch.Size([batch_num, 21, 200 5])
+            # torch.Size([batch_num, 21, 200, 5])
             return self.detect(output[0], output[1], output[2])
         else:
             # tupple (loc, conf, dbox_list)
@@ -365,3 +486,6 @@ if __name__ == '__main__':
 
     ssd_test = SSD(phase='train', ssd_cfg = dbox_cfg)
     print(ssd_test)
+
+    loss = MultiBoxLoss()
+
