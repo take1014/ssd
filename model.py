@@ -353,15 +353,19 @@ class MultiBoxLoss(nn.Module):
         # Calc cross_entropy. conf_t_label.view(-1) = torch.Size([num_batch*8732])
         loss_c = F.cross_entropy(batch_conf, conf_t_label.view(-1), reduction='none')
 
-        # Calc Positive Box's loss.
-        # Positive Box's confidence loss is zero
+        #===== Calc Positive Box's loss. =====
         # loss_c: torch.Size([num_batch, 8732])
         loss_c = loss_c.view(num_batch, -1)
+        # Set positive box confidence loss to 0.
         loss_c[pos_mask] = 0
+        #====================================
 
         # Hard Negative Mining
+        # loss_idx: torch.Size([num_batch, 8732])
         # _: sorted Tensor, loss_idx: indices
         _, loss_idx = loss_c.sort(dim=1, descending=True)
+
+        # idx_rank: torch.Size([num_batch, 8732])
         # _: sorted Tensor, idx_rank: indices(sorted)
         _, idx_rank = loss_idx.sort(dim=1)
 
