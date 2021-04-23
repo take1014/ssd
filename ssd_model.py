@@ -6,7 +6,6 @@ import torch.nn as nn
 import torch.nn.init as init
 import torch.nn.functional as F
 from torch.autograd import Function
-from utils import match
 import torch.utils.data as data
 import torch
 

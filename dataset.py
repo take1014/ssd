@@ -7,10 +7,6 @@ import cv2
 from preprocess import Anno_xml2list, DataTransform
 
 # pytorch library
-#import torch.nn as nn
-#import torch.nn.init as init
-#import torch.nn.functional as F
-#from torch.autograd import Function
 import torch.utils.data as data
 import torch
 
