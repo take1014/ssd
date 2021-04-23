@@ -1,9 +1,7 @@
-
-# GitHub：amdegroot/ssd.pytorch を参考にしています。
+#!/usr/bin/env python3
+#-*- coding:utf-8 -*-
 # MIT License
 # Copyright (c) 2017 Max deGroot, Ellis Brown
-# https://github.com/amdegroot/ssd.pytorch/blob/master/utils/augmentations.py
-# data augumentation BBoxごと変形させる
 
 
 import torch

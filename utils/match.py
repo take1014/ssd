@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+#-*- coding:utf-8 -*-
+
 """
 MIT License
 Copyright (c) 2017 Max deGroot, Ellis Brown
