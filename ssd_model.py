@@ -3,10 +3,7 @@
 from itertools import product as product
 from math import sqrt as sqrt
 import torch.nn as nn
-import torch.nn.init as init
 import torch.nn.functional as F
-from torch.autograd import Function
-import torch.utils.data as data
 import torch
 
 def make_vgg():
@@ -80,7 +77,7 @@ class L2Norm(nn.Module):
         self.eps = 1e-10
 
     def reset_parameters(self):
-        init.constant_(self.weight, self.scale)
+        nn.init.constant_(self.weight, self.scale)
 
     def forward(self, x):
         norm = x.pow(2).sum(dim=1, keepdim=True).sqrt()+self.eps
@@ -143,7 +140,7 @@ def decode(loc, dbox_list):
     '''
 
     boxes = torch.cat((
-        dbox_list[:,2] + loc[:, :2] * 0.1 * dbox_list[:, 2:],   # [cx, cy]
+        dbox_list[:,:2] + loc[:, :2] * 0.1 * dbox_list[:, 2:],   # [cx, cy]
         dbox_list[:,2:] * torch.exp(loc[:, 2:] * 0.2)), dim=1)  # [w, h]
 
     # [cx, cy, width, height] -> [xmin, ymin, xmax, ymax]
@@ -231,15 +228,9 @@ def nm_suppression(boxes, scores, overlap=0.45, top_k=200):
         idx = idx[IoU.le(overlap)]
     return keep, count
 
-class Detect(Function):
-    def __init__(self, conf_thresh=0.01, top_k=200, nms_thresh=0.45):
-        self.softmax = nn.Softmax(dim=-1)
-        self.conf_thresh = conf_thresh
-        self.top_k = top_k
-        self.nms_thresh = nms_thresh
-
-    def forward(self, loc_data, conf_data, dbox_list):
-
+class Detect(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, loc_data, conf_data, dbox_list):
         '''
         loc_data  = [batch_num, 8732, 4]
             location information
@@ -248,14 +239,21 @@ class Detect(Function):
         dbox_list = [8732, 4]
             DBox information
         '''
-        num_batch   = loc_data.size(0)
-        num_dbox    = loc_data.size(1)
+        #===== Constant values and method =====
+        conf_thresh = 0.01
+        top_k       = 200
+        nms_thresh  = 0.45
+        softmax     = nn.Softmax(dim=-1)
+        #======================================
+
+        num_batch   = conf_data.size(0)
+        num_dbox    = conf_data.size(1)
         num_classes = conf_data.size(2)
 
-        conf_data = self.softmax(conf_data)
+        conf_data = softmax(conf_data)
 
         # create output template
-        output = torch.zeros(num_batch, num_classes, self.top_k, 5)
+        output = torch.zeros(num_batch, num_classes, top_k, 5)
 
         # [batch_num, 8732, num_classes]  ->  [batch_num, num_classes, 8732]
         conf_preds = conf_data.transpose(2, 1)
@@ -266,7 +264,7 @@ class Detect(Function):
             conf_scores = conf_preds[i].clone()
             for cl in range(1, num_classes):
                 # create conf mask.  conf > conf_thresh
-                c_mask = conf_scores[cl].gt(self.conf_thresh)
+                c_mask = conf_scores[cl].gt(conf_thresh)
                 scores = conf_scores[cl][c_mask]
 
                 if scores.nelement()==0:
@@ -277,7 +275,7 @@ class Detect(Function):
                 # torch.Size([Bounding box's count, 4])
                 boxes = decoded_boxes[l_mask].view(-1, 4)
 
-                ids, count = nm_suppression(boxes, scores, self.nms_thresh, self.top_k)
+                ids, count = nm_suppression(boxes, scores, nms_thresh, top_k)
 
                 # update output
                 output[i, cl, :count] = torch.cat((scores[ids[:count]].unsqueeze(1), boxes[ids[:count]]), 1)
@@ -296,9 +294,6 @@ class SSD(nn.Module):
         self.loc, self.conf = make_loc_conf(ssd_cfg['num_classes'], ssd_cfg['bbox_aspect_num'])
         dbox = DBox(ssd_cfg)
         self.dbox_list = dbox.make_dbox_list()
-
-        if phase == 'inference':
-            self.detect = Detect()
 
     def forward(self, x):
         sources = list()
@@ -340,7 +335,7 @@ class SSD(nn.Module):
 
         if self.phase == 'inference':
             # torch.Size([batch_num, 21, 200, 5])
-            return self.detect(output[0], output[1], output[2])
+            return Detect.apply(output[0], output[1], output[2])
         else:
             # tupple (loc, conf, dbox_list)
             return output
